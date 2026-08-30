@@ -1,0 +1,17 @@
+{
+  "name": "gold-rush-engine",
+  "version": "1.0.0",
+  "description": "Ultimate Financial Gaming Engine with Provably Fair and Banking System",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
