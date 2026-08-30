@@ -18,7 +18,6 @@ function generateProvablyFairResult(serverSeed, clientSeed, nonce) {
         .update(`${clientSeed}:${nonce}`)
         .digest('hex');
     
-    // Convertit les 8 premiers caractères hexadécimaux en nombre entre 0 et 5 (zone du gardien)
     const subHash = hash.substring(0, 8);
     const decimalValue = parseInt(subHash, 16);
     const keeperPosition = decimalValue % 6;
@@ -34,9 +33,8 @@ const leaderboard = [
     { name: 'GoldHunter', netWorth: 45000 }
 ];
 
-// --- GESTION DU TEMPS RÉEL (SOCKET.IO) ---
+// --- GESTION TEMPS RÉEL (SOCKET.IO) ---
 io.on('connection', (socket) => {
-    // Initialisation du joueur
     players[socket.id] = {
         id: socket.id,
         name: `Trader_${socket.id.substring(0, 4)}`,
@@ -53,13 +51,11 @@ io.on('connection', (socket) => {
 
     const player = players[socket.id];
 
-    // Envoi de l'état initial
     socket.emit('init_state', {
         player,
         leaderboard
     });
 
-    // ÉVÉNEMENT : SYSTÈME DE PRÊT / BANQUE
     socket.on('take_loan', (amount) => {
         if (player.debt > 0) {
             return socket.emit('error_msg', "Remboursez d'abord votre prêt actif !");
@@ -68,7 +64,7 @@ io.on('connection', (socket) => {
             return socket.emit('error_msg', "Plafond de prêt dépassé ($1,000 max) !");
         }
 
-        const interest = Math.round(amount * 0.10); // 10% d'intérêt
+        const interest = Math.round(amount * 0.10);
         player.debt = amount + interest;
         player.balance += amount;
         
@@ -83,16 +79,14 @@ io.on('connection', (socket) => {
 
         player.balance -= player.debt;
         player.debt = 0;
-        player.creditScore = Math.min(850, player.creditScore + 15); // Améliore le score de crédit
+        player.creditScore = Math.min(850, player.creditScore + 15);
 
         broadcastUpdate(socket, player);
     });
 
-    // ÉVÉNEMENT : TIR AU PENALTY (GOLD STRIKE)
     socket.on('play_shot', (targetZone) => {
         const multipliers = [1.95, 3.80, 7.50, 15.00, 30.00];
 
-        // Nouvelle partie si pas encore en jeu
         if (!player.inGame) {
             if (player.currentBet <= 0 || player.currentBet > player.balance) {
                 return socket.emit('error_msg', 'Mise invalide ou solde insuffisant !');
@@ -102,18 +96,15 @@ io.on('connection', (socket) => {
             player.step = 0;
         }
 
-        // Calcul du résultat Provably Fair côté serveur
         player.nonce++;
         const pfResult = generateProvablyFairResult(player.serverSeed, player.clientSeed, player.nonce);
         const keeperPos = pfResult.keeperPosition;
 
         if (targetZone === keeperPos) {
-            // ARRÊT DU GARDIEN -> PERDU
             const lostBet = player.currentBet;
             player.inGame = false;
             player.step = 0;
 
-            // Vérification de liquidation si la dette dépasse le solde
             checkLiquidation(player, socket);
 
             socket.emit('shot_result', {
@@ -124,12 +115,10 @@ io.on('connection', (socket) => {
                 nonce: player.nonce
             });
         } else {
-            // BUT MARQUÉ !
             player.step++;
             const currentMult = multipliers[player.step - 1];
 
             if (player.step >= multipliers.length) {
-                // VICTOIRE MAX (x30)
                 const winAmount = Math.round(player.currentBet * currentMult);
                 player.balance += winAmount;
                 player.inGame = false;
@@ -145,7 +134,6 @@ io.on('connection', (socket) => {
                     nonce: player.nonce
                 });
             } else {
-                // FRANCHISSEMENT DE PALIER
                 socket.emit('shot_result', {
                     success: true,
                     keeperPos,
@@ -161,7 +149,6 @@ io.on('connection', (socket) => {
         broadcastUpdate(socket, player);
     });
 
-    // ÉVÉNEMENT : CASHOUT
     socket.on('cashout', () => {
         if (!player.inGame || player.step === 0) return;
 
@@ -199,7 +186,6 @@ function checkLiquidation(player, socket) {
 }
 
 function broadcastUpdate(socket, player) {
-    // Mettre à jour le classement
     let userRank = leaderboard.find(p => p.name === player.name);
     if (!userRank) {
         userRank = { name: player.name, netWorth: 0 };
@@ -212,10 +198,9 @@ function broadcastUpdate(socket, player) {
     io.emit('update_leaderboard', leaderboard.slice(0, 5));
 }
 
-// --- RENDU SINGLE PAGE APPLICATION (INTERFACE DUAL-MODE MOBILE/DESKTOP) ---
+// --- RENDU APPLICATION ---
 app.get('*', (req, res) => {
-    res.send(`
-<!DOCTYPE html>
+    res.send(`<!DOCTYPE html>
 <html lang="fr">
 <head>
     <meta charset="UTF-8">
@@ -248,7 +233,6 @@ app.get('*', (req, res) => {
             background-image: radial-gradient(circle at 50% 0%, rgba(255, 215, 0, 0.05) 0%, transparent 70%);
         }
 
-        /* HEADER */
         header {
             background: rgba(15, 20, 29, 0.95);
             border-bottom: 1px solid rgba(255, 215, 0, 0.2);
@@ -291,7 +275,6 @@ app.get('*', (req, res) => {
             color: var(--gold-primary);
         }
 
-        /* LAYOUT & NAVIGATION DUAL-MODE */
         .app-container {
             flex: 1;
             display: flex;
@@ -332,7 +315,6 @@ app.get('*', (req, res) => {
         .tab-content { display: none; flex-direction: column; gap: 12px; }
         .tab-content.active { display: flex; }
 
-        /* PANNEAUX */
         .panel {
             background: var(--panel-bg);
             border-radius: 14px;
@@ -353,7 +335,6 @@ app.get('*', (req, res) => {
             text-transform: uppercase;
         }
 
-        /* ARÈNE DE JEU */
         .game-card {
             background: radial-gradient(circle at top, #141c2b 0%, #090d15 100%);
             border: 1px solid rgba(255, 215, 0, 0.25);
@@ -429,7 +410,6 @@ app.get('*', (req, res) => {
 
         .target-btn:active { background: rgba(255, 215, 0, 0.3); transform: scale(0.95); }
 
-        /* BOUTONS ET INPUTS */
         .btn {
             padding: 14px;
             border-radius: 10px;
@@ -475,7 +455,6 @@ app.get('*', (req, res) => {
             font-size: 0.9rem;
         }
 
-        /* DESKTOP (ÉCRANS > 900px) */
         @media (min-width: 900px) {
             .mobile-tabs { display: none; }
             .app-container {
@@ -505,14 +484,12 @@ app.get('*', (req, res) => {
 
     <div class="app-container">
 
-        <!-- NAV TABS MOBILE -->
         <div class="mobile-tabs">
-            <div class="tab-btn active" onclick="switchTab('game')">🎮 Jeu</div>
-            <div class="tab-btn" onclick="switchTab('bank')">🏦 Banque</div>
-            <div class="tab-btn" onclick="switchTab('ranks')">🏆 Rangs</div>
+            <div class="tab-btn active" onclick="switchTab('game', event)">🎮 Jeu</div>
+            <div class="tab-btn" onclick="switchTab('bank', event)">🏦 Banque</div>
+            <div class="tab-btn" onclick="switchTab('ranks', event)">🏆 Rangs</div>
         </div>
 
-        <!-- ONGLET BANQUE -->
         <div class="tab-content" id="tab-bank">
             <div class="panel">
                 <div class="panel-title">Système de Prêt</div>
@@ -537,7 +514,6 @@ app.get('*', (req, res) => {
             </div>
         </div>
 
-        <!-- ONGLET JEU (PENALTY STRIKE) -->
         <div class="tab-content active" id="tab-game">
             <div class="game-card">
                 
@@ -576,7 +552,178 @@ app.get('*', (req, res) => {
             </div>
         </div>
 
-        <!-- ONGLET CLASSEMENT -->
         <div class="tab-content" id="tab-ranks">
             <div class="panel">
-                <div class="p
+                <div class="panel-title">Wall Street Leaderboard 🏆</div>
+                <div id="leaderboard-list" style="display:flex; flex-direction:column; gap:8px;"></div>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        const socket = io();
+        let audioCtx = null;
+
+        function initAudio() {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+
+        function playSound(freq, duration) {
+            initAudio();
+            if(!audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.frequency.value = freq;
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start();
+            gain.gain.exponentialRampToValueAtTime(0.00001, audioCtx.currentTime + duration);
+            osc.stop(audioCtx.currentTime + duration);
+        }
+
+        function vibrate(ms) {
+            if (navigator.vibrate) navigator.vibrate(ms);
+        }
+
+        function switchTab(tabName, evt) {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            
+            if(tabName === 'game') document.getElementById('tab-game').classList.add('active');
+            if(tabName === 'bank') document.getElementById('tab-bank').classList.add('active');
+            if(tabName === 'ranks') document.getElementById('tab-ranks').classList.add('active');
+            if(evt && evt.target) evt.target.classList.add('active');
+        }
+
+        socket.on('init_state', (data) => {
+            updatePlayerUI(data.player);
+            renderLeaderboard(data.leaderboard);
+        });
+
+        socket.on('update_player', (player) => {
+            updatePlayerUI(player);
+        });
+
+        socket.on('update_leaderboard', (lb) => {
+            renderLeaderboard(lb);
+        });
+
+        socket.on('shot_result', (res) => {
+            moveKeeper(res.keeperPos);
+            document.getElementById('hash-display').innerText = res.hash;
+
+            const status = document.getElementById('status-display');
+            status.innerText = res.msg;
+
+            if (res.success) {
+                playSound(600, 0.15);
+                vibrate(50);
+                status.style.color = "var(--gold-primary)";
+                highlightStep(res.step - 1);
+                document.getElementById('cashout-btn').disabled = false;
+            } else {
+                playSound(150, 0.3);
+                vibrate([100, 50, 100]);
+                status.style.color = "var(--red-alert)";
+                resetGameUI();
+            }
+        });
+
+        socket.on('cashout_success', (res) => {
+            playSound(800, 0.25);
+            vibrate(100);
+            const status = document.getElementById('status-display');
+            status.innerText = res.msg;
+            status.style.color = "var(--green-win)";
+            resetGameUI();
+        });
+
+        socket.on('error_msg', (msg) => {
+            alert(msg);
+        });
+
+        socket.on('liquidation_alert', (msg) => {
+            playSound(100, 0.5);
+            vibrate(500);
+            alert(msg);
+        });
+
+        function shoot(zoneIndex) {
+            initAudio();
+            socket.emit('play_shot', zoneIndex);
+        }
+
+        function cashout() {
+            socket.emit('cashout');
+        }
+
+        function updateBet() {
+            const val = document.getElementById('bet-amount').value;
+            socket.emit('set_bet', val);
+        }
+
+        function takeLoan() {
+            socket.emit('take_loan', 500);
+        }
+
+        function repayLoan() {
+            socket.emit('repay_loan');
+        }
+
+        function updatePlayerUI(p) {
+            document.getElementById('balance-display').innerText = '$' + p.balance.toLocaleString();
+            document.getElementById('debt-display').innerText = '$' + p.debt.toLocaleString();
+            document.getElementById('credit-display').innerText = p.creditScore;
+        }
+
+        function renderLeaderboard(lb) {
+            const container = document.getElementById('leaderboard-list');
+            container.innerHTML = '';
+            lb.forEach((item, idx) => {
+                container.innerHTML += \`
+                    <div class="leader-item">
+                        <span style="color:var(--gold-primary); font-weight:bold;">#\${idx+1}</span>
+                        <span>\${item.name}</span>
+                        <span style="font-family:'Orbitron'">$\${item.netWorth.toLocaleString()}</span>
+                    </div>
+                \`;
+            });
+        }
+
+        function moveKeeper(pos) {
+            const keeper = document.getElementById('keeper');
+            const coords = [
+                { top: '15px', left: '15%' }, { top: '15px', left: '45%' }, { top: '15px', left: '75%' },
+                { top: '110px', left: '15%' }, { top: '110px', left: '45%' }, { top: '110px', left: '75%' }
+            ];
+            keeper.style.top = coords[pos].top;
+            keeper.style.left = coords[pos].left;
+        }
+
+        function highlightStep(idx) {
+            document.querySelectorAll('.mult-step').forEach(el => el.classList.remove('active'));
+            if (idx >= 0) {
+                const el = document.getElementById(\`step-\${idx}\`);
+                if (el) el.classList.add('active');
+            }
+        }
+
+        function resetGameUI() {
+            document.getElementById('cashout-btn').disabled = true;
+            setTimeout(() => {
+                document.querySelectorAll('.mult-step').forEach(el => el.classList.remove('active'));
+            }, 1200);
+        }
+
+        updateBet();
+    </script>
+</body>
+</html>`);
+});
+
+// PORTS POUR RENDER
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`🚀 Serveur Gold Rush prêt sur le port ${PORT}`);
+});
