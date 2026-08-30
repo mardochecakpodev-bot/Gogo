@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Gold Rush Engine - Ultimate Financial Arcade</title>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <style>
+        /* ==========================================
+           1. CHARTE GRAPHIQUE & VARIABLES
+           ========================================== */
+        :root {
+            --obsidian: #07090E;
+            --slate: #0F141D;
+            --slate-light: #1A212D;
+            --gold: #FFD700;
+            --gold-glow: rgba(255, 215, 0, 0.4);
+            --emerald: #00E676;
+            --crimson: #FF2A5F;
+            --text-main: #E2E8F0;
+            --text-muted: #64748B;
+            --font-main: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            --font-mono: 'Courier New', Courier, monospace;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; touch-action: manipulation; }
+        
+        body {
+            background-color: var(--obsidian);
+            color: var(--text-main);
+            font-family: var(--font-main);
+            height: 100vh;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* ==========================================
+           2. HEADER (TOP BAR)
+           ========================================== */
+        header {
+            background-color: var(--slate);
+            padding: 15px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 2px solid var(--gold);
+            z-index: 100;
+        }
+        
+        .logo { font-size: 20px; font-weight: 900; color: var(--gold); text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 0 10px var(--gold-glow); }
+        
+        .financial-stats {
+            display: flex;
+            gap: 20px;
+        }
+        .stat-box { display: flex; flex-direction: column; align-items: flex-end; }
+        .stat-label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; }
+        .stat-value { font-size: 18px; font-weight: bold; font-family: var(--font-mono); }
+        .val-gold { color: var(--gold); }
+        .val-crimson { color: var(--crimson); }
+        .val-emerald { color: var(--emerald); }
+
+        /* ==========================================
+           3. LAYOUT PRINCIPAL (DUAL-MODE)
+           ========================================== */
+        #main-layout {
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .panel {
+            background-color: var(--slate-light);
+            border-radius: 8px;
+            margin: 10px;
+            padding: 15px;
+            display: flex;
+            flex-direction: column;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            overflow-y: auto;
+        }
+
+        .panel-title {
+            font-size: 14px; color: var(--text-muted); text-transform: uppercase;
+            margin-bottom: 15px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 5px;
+        }
+
+        /* MOBILE FIRST : Panels cachés par défaut sauf celui actif */
+        #bank-panel, #rocket-panel, #feed-panel { display: none; }
+        #penalty-panel { display: flex; width: 100%; margin: 10px; } /* Actif par défaut sur mobile */
+
+        /* DESKTOP : Dashboard Bloomberg Style */
+        @media (min-width: 900px) {
+            #main-layout {
+                display: grid;
+                grid-template-columns: 280px 1fr 280px;
+            }
+            #bottom-nav { display: none !important; }
+            .panel { display: flex !important; margin: 10px; width: auto; }
+            #penalty-panel { grid-column: 2; grid-row: 1; height: 50%; }
+            #rocket-panel { grid-column: 2; grid-row: 1; margin-top: auto; height: calc(50% - 20px); }
+            #bank-panel { grid-column: 1; grid-row: 1; }
+            #feed-panel { grid-column: 3; grid-row: 1; }
+        }
+
+        /* ==========================================
+           4. MOBILE BOTTOM NAV
+           ========================================== */
+        #bottom-nav {
+            background-color: var(--slate);
+            border-top: 1px solid rgba(255,255,255,0.1);
+            display: flex;
+            justify-content: space-around;
+            padding: 10px 0;
+            padding-bottom: env(safe-area-inset-bottom, 10px);
+        }
+        .nav-btn {
+            background: none; border: none; color: var(--text-muted);
+            font-size: 12px; font-weight: bold; text-transform: uppercase;
+            display: flex; flex-direction: column; align-items: center; gap: 5px; cursor: pointer;
+        }
+        .nav-btn.active { color: var(--gold); }
+        .nav-btn i { font-size: 20px; font-style: normal; }
+
+        /* ==========================================
+           5. PENALTY GOLD STRIKE (JEU 1)
+           ========================================== */
+        .penalty-container { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+        
+        .multiplier-bar { display: flex; gap: 5px; margin-bottom: 20px; width: 100%; justify-content: center;}
+        .mult-badge { 
+            background: var(--obsidian); border: 1px solid rgba(255,255,255,0.2); 
+            padding: 5px 10px; border-radius: 4px; font-family: var(--font-mono); font-size: 12px; color: var(--text-muted);
+        }
+        .mult-badge.active { background: var(--gold); color: black; border-color: var(--gold); font-weight: bold; box-shadow: 0 0 10px var(--gold-glow); }
+
+        .goal-grid {
+            display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
+            width: 100%; max-width: 400px; aspect-ratio: 3/2; background: rgba(0,0,0,0.5);
+            border: 3px solid rgba(255,255,255,0.1); border-radius: 10px; padding: 10px; position: relative;
+        }
+        .goal-zone {
+            background: rgba(255,255,255,0.05); border: 1px dashed rgba(255,255,255,0.2);
+            border-radius: 5px; cursor: pointer; display: flex; justify-content: center; align-items: center;
+            font-size: 24px; transition: all 0.2s; pointer-events: none;
+        }
+        .goal-zone.active-target { pointer-events: auto; }
+        .goal-zone.active-target:hover { background: rgba(255,215,0,0.2); border-color: var(--gold); }
+        .goal-zone.win { background: rgba(0, 230, 118, 0.3); border-color: var(--emerald); box-shadow: inset 0 0 15px var(--emerald); }
+        .goal-zone.lose { background: rgba(255, 42, 95, 0.3); border-color: var(--crimson); box-shadow: inset 0 0 15px var(--crimson); content: '💥'; }
+
+        .control-panel { margin-top: 20px; width: 100%; max-width: 400px; display: flex; flex-direction: column; gap: 10px; }
+        .input-group { display: flex; background: var(--obsidian); border-radius: 5px; border: 1px solid rgba(255,255,255,0.1); overflow: hidden; }
+        .input-group input { flex: 1; background: none; border: none; color: white; padding: 15px; font-family: var(--font-mono); font-size: 16px; outline: none; }
+        
+        .btn { padding: 15px; font-size: 16px; font-weight: 900; text-transform: uppercase; border: none; border-radius: 5px; cursor: pointer; transition: 0.1s; }
+        .btn:active { transform: scale(0.95); }
+        .btn-gold { background: var(--gold); color: black; box-shadow: 0 0 15px var(--gold-glow); }
+        
+        /* Bouton Cashout Géant Néon */
+        .btn-cashout {
+            background: var(--emerald); color: black; font-size: 24px; padding: 20px;
+            box-shadow: 0 0 20px rgba(0, 230, 118, 0.6); display: none;
+            animation: pulse-green 1s infinite alternate;
+        }
+        @keyframes pulse-green { from { box-shadow: 0 0 10px rgba(0,230,118,0.4); } to { box-shadow: 0 0 25px rgba(0,230,118,0.8); } }
+
+        /* ==========================================
+           6. GOLD ROCKET & BANQUE
+           ========================================== */
+        .rocket-display { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+        .rocket-multiplier { font-size: 60px; font-weight: 900; font-family: var(--font-mono); color: var(--emerald); text-shadow: 0 0 20px rgba(0,230,118,0.5); }
+        .rocket-multiplier.crashed { color: var(--crimson); text-shadow: 0 0 20px rgba(255,42,95,0.5); }
+
+        .bank-controls { display: flex; flex-direction: column; gap: 15px; }
+        .bank-info { background: var(--obsidian); padding: 15px; border-radius: 5px; font-family: var(--font-mono); font-size: 14px; margin-bottom: 10px; }
+        .bank-info div { display: flex; justify-content: space-between; margin-bottom: 5px; }
+        .btn-outline { background: transparent; border: 1px solid var(--text-muted); color: var(--text-main); }
+        
+        .feed-list { list-style: none; overflow-y: auto; flex: 1; font-family: var(--font-mono); font-size: 12px; }
+        .feed-list li { padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between; }
+
+        /* ==========================================
+           7. MODAL ALERTE LIQUIDATION
+           ========================================== */
+        #margin-call-overlay {
+            position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+            background: rgba(255, 42, 95, 0.9); z-index: 9999;
+            display: none; flex-direction: column; justify-content: center; align-items: center;
+            animation: flash-red 0.1s infinite alternate; text-align: center; padding: 20px;
+        }
+        @keyframes flash-red { from { background: rgba(255, 42, 95, 0.8); } to { background: rgba(200, 0, 0, 1); } }
+        #margin-call-overlay h1 { font-size: 40px; color: white; text-transform: uppercase; margin-bottom: 10px; }
+        #margin-call-overlay p { font-size: 20px; color: white; font-family: var(--font-mono); }
+    </style>
+</head>
+<body>
+
+    <!-- LIQUIDATION MODAL -->
+    <div id="margin-call-overlay">
+        <h1>MARGIN CALL</h1>
+        <p>LIQUIDATION FLASH DE VOTRE COMPTE</p>
+        <p>Fonds insuffisants pour couvrir l'effet de levier.</p>
+    </div>
+
+    <!-- HEADER -->
+    <header>
+        <div class="logo">GOLD RUSH</div>
+        <div class="financial-stats">
+            <div class="stat-box">
+                <span class="stat-label">Credit Score</span>
+                <span class="stat-value val-emerald" id="ui-credit">---</span>
+            </div>
+            <div class="stat-box">
+                <span class="stat-label">Dette (Marge)</span>
+                <span class="stat-value val-crimson" id="ui-debt">$0.00</span>
+            </div>
+            <div class="stat-box">
+                <span class="stat-label">Solde Net</span>
+                <span class="stat-value val-gold" id="ui-balance">$0.00</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- MAIN DASHBOARD -->
+    <div id="main-layout">
+        
+        <!-- PANEL: BANQUE -->
+        <div class="panel" id="bank-panel">
+            <div class="panel-title">Banque Centrale & Marge</div>
+            <div class="bank-info">
+                <div><span>Taux d'intérêt:</span><span id="ui-rate">--%</span></div>
+                <div><span>Capacité Max:</span><span id="ui-max-borrow">$--</span></div>
+            </div>
+            <div class="bank-controls">
+                <div class="input-group">
+                    <input type="number" id="bank-amount" placeholder="Montant ($)" value="1000">
+                </div>
+                <button class="btn btn-outline" onclick="bankAction('borrow')">Emprunter (Levier)</button>
+                <button class="btn btn-outline" onclick="bankAction('repay')">Rembourser Dette</button>
+            </div>
+        </div>
+
+        <!-- PANEL: PENALTY (JEU 1) -->
+        <div class="panel" id="penalty-panel">
+            <div class="panel-title">Penalty Gold Strike (Provably Fair)</div>
+            <div class="penalty-container">
+                <div class="multiplier-bar" id="penalty-multipliers">
+                    <div class="mult-badge" id="mult-1">1.95x</div>
+                    <div class="mult-badge" id="mult-2">3.80x</div>
+                    <div class="mult-badge" id="mult-3">7.50x</div>
+                    <div class="mult-badge" id="mult-4">15.00x</div>
+                    <div class="mult-badge" id="mult-5">30.00x</div>
+                    <div class="mult-badge" id="mult-6">60.00x</div>
+                </div>
+                
+                <div class="goal-grid" id="goal-grid">
+                    <div class="goal-zone" onclick="shoot(0)"></div>
+                    <div class="goal-zone" onclick="shoot(1)"></div>
+                    <div class="goal-zone" onclick="shoot(2)"></div>
+                    <div class="goal-zone" onclick="shoot(3)"></div>
+                    <div class="goal-zone" onclick="shoot(4)"></div>
+                    <div class="goal-zone" onclick="shoot(5)"></div>
+                </div>
+
+                <div class="control-panel">
+                    <div class="input-group" id="penalty-input-group">
+                        <input type="number" id="penalty-bet" placeholder="Mise ($)" value="100">
+                    </div>
+                    <button class="btn btn-gold" id="btn-start-penalty" onclick="startPenalty()">Placer Mise</button>
+                    <button class="btn btn-cashout" id="btn-cashout-penalty" onclick="cashoutPenalty()">CASHOUT</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- PANEL: ROCKET (JEU 2) -->
+        <div class="panel" id="rocket-panel">
+            <div class="panel-title">Gold Rocket (Live)</div>
+            <div class="rocket-display">
+                <div class="rocket-multiplier" id="rocket-mult">1.00x</div>
+                <div style="color: var(--text-muted); font-family: var(--font-mono); margin-top: 10px;" id="rocket-status">En attente de connexion...</div>
+            </div>
+            <div class="control-panel" style="margin: 0 auto; margin-top: 20px;">
+                <div class="input-group">
+                    <input type="number" id="rocket-bet" placeholder="Mise ($)" value="100">
+                </div>
+                <button class="btn btn-gold" id="btn-rocket-action" onclick="rocketAction()">Parier (Prochain tour)</button>
+            </div>
+        </div>
+
+        <!-- PANEL: LIVE FEED -->
+        <div class="panel" id="feed-panel">
+            <div class="panel-title">Live Server Feed</div>
+            <ul class="feed-list" id="live-feed">
+                <li><span style="color: var(--text-muted);">Système initialisé.</span></li>
+            </ul>
+        </div>
+    </div>
+
+    <!-- BOTTOM NAV (MOBILE) -->
+    <div id="bottom-nav">
+        <button class="nav-btn" onclick="switchTab('bank')"><i>🏦</i>Bank</button>
+        <button class="nav-btn active" onclick="switchTab('penalty')"><i>⚽</i>Strike</button>
+        <button class="nav-btn" onclick="switchTab('rocket')"><i>🚀</i>Rocket</button>
+        <button class="nav-btn" onclick="switchTab('feed')"><i>📡</i>Feed</button>
+    </div>
+
+    <!-- SCRIPTS LOGIQUE -->
+    <script>
+        // ==========================================
+        // 1. INITIALISATION & MOTEUR SENSORIEL
+        // ==========================================
+        const socket = io();
+        const USER_ID = 'player_1';
+        let currentState = { balance: 0, debt: 0, creditScore: 0, penaltyActive: false };
+        let audioCtx = null;
+
+        // Init Web Audio API au premier clic (Politique Navigateur)
+        document.body.addEventListener('click', () => {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+        }, { once: true });
+
+        // Synthetiseur Audio Natif
+        function playTone(freq, type, duration, vol = 0.1) {
+            if (!audioCtx) return;
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = type;
+            osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+            gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + duration);
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start();
+            osc.stop(audioCtx.currentTime + duration);
+        }
+
+        const SFX = {
+            click: () => playTone(1000, 'sine', 0.05, 0.05),
+            coin: () => { playTone(1200, 'sine', 0.1, 0.1); setTimeout(()=>playTone(1600, 'sine', 0.2, 0.1), 100); },
+            win: () => { playTone(600, 'square', 0.1, 0.1); setTimeout(()=>playTone(800, 'square', 0.3, 0.1), 100); },
+            lose: () => playTone(150, 'sawtooth', 0.5, 0.3),
+            alert: () => { playTone(300, 'square', 0.5, 0.5); setTimeout(()=>playTone(300, 'square', 0.5, 0.5), 600); }
+        };
+
+        // Web Haptics
+        function vibrate(pattern) {
+            if (navigator.vibrate) navigator.vibrate(pattern);
+        }
+
+        function logFeed(msg, color = 'var(--text-main)') {
+            const feed = document.getElementById('live-feed');
+            const li = document.createElement('li');
+            li.innerHTML = `<span style="color: ${color}">${msg}</span><span>${new Date().toLocaleTimeString()}</span>`;
+            feed.prepend(li);
+            if (feed.children.length > 20) feed.removeChild(feed.lastChild);
+        }
+
+        // ==========================================
+        // 2. UI UPDATES & NAVIGATION
+        // ==========================================
+        function updateFinancials(data) {
+            if(data.balance !== undefined) {
+                document.getElementById('ui-balance').innerText = `$${data.balance.toFixed(2)}`;
+                currentState.balance = data.balance;
+            }
+            if(data.debt !== undefined) {
+                document.getElementById('ui-debt').innerText = `$${data.debt.toFixed(2)}`;
+                currentState.debt = data.debt;
+            }
+            if(data.creditScore !== undefined) {
+                document.getElementById('ui-credit').innerText = data.creditScore;
+                currentState.creditScore = data.creditScore;
+                
+                const rate = (15 - ((data.creditScore - 300) / 550) * 10).toFixed(1);
+                document.getElementById('ui-rate').innerText = `${rate}%`;
+                document.getElementById('ui-max-borrow').innerText = `$${(data.creditScore - 300) * 10}`;
+            }
+        }
+
+        function switchTab(tabId) {
+            SFX.click();
+            if (window.innerWidth >= 900) return; // Desktop gère via CSS Grid
+            
+            ['bank', 'penalty', 'rocket', 'feed'].forEach(id => {
+                document.getElementById(`${id}-panel`).style.display = 'none';
+            });
+            document.querySelectorAll('.nav-btn').forEach(btn => btn.classList.remove('active'));
+            
+            document.getElementById(`${tabId}-panel`).style.display = 'flex';
+            event.currentTarget.classList.add('active');
+        }
+
+        // ==========================================
+        // 3. LOGIQUE BANCAIRE (REST API)
+        // ==========================================
+        async function bankAction(action) {
+            SFX.click();
+            const amount = parseFloat(document.getElementById('bank-amount').value);
+            if (isNaN(amount) || amount <= 0) return alert("Montant invalide");
+
+            try {
+                const res = await fetch(`/api/bank/${action}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/j
