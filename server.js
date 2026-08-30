@@ -11,80 +11,89 @@ const io = new Server(server, { cors: { origin: '*' } });
 app.use(cors());
 app.use(express.json());
 
-// --- MOTEUR PROVABLY FAIR (CRYPTOGRAPHIE SHA-256) ---
-function generateProvablyFairResult(serverSeed, clientSeed, nonce) {
+// --- BASES DE DONNÉES EN MÉMOIRE (PERSISTANTS PAR APPAREIL) ---
+const devices = {}; // Empreinte d'appareil -> ID de compte
+const accounts = {}; // ID de compte -> Données
+const leaderboard = [];
+
+// --- ALGORITHME D'AJUSTEMENT DU RISQUE SELON LA MISE ---
+function calculateAdjustedRisk(player, betAmount) {
+    const betRatio = betAmount / Math.max(player.balance, 1);
+    // Risque de base = 1/6 (~16.6% de chance d'arrêt)
+    let lossProbability = 0.166;
+
+    // Si le joueur mise plus de 30% de son solde, le taux de risque augmente progressivement
+    if (betRatio > 0.3) {
+        lossProbability += (betRatio - 0.3) * 0.25;
+    }
+
+    // Sécurité : le risque ne dépasse jamais 45%
+    return Math.min(lossProbability, 0.45);
+}
+
+// --- MOTEUR PROVABLY FAIR ---
+function generateFairDraw(serverSeed, clientSeed, nonce, riskFactor) {
     const hash = crypto
         .createHmac('sha256', serverSeed)
         .update(`${clientSeed}:${nonce}`)
         .digest('hex');
-    
-    const subHash = hash.substring(0, 8);
-    const decimalValue = parseInt(subHash, 16);
-    const keeperPosition = decimalValue % 6;
 
-    return { hash, keeperPosition };
+    const randVal = parseInt(hash.substring(0, 8), 16) / 0xFFFFFFFF;
+    
+    // Si la valeur aléatoire tombe dans la zone de risque calculée -> Arrêt/Perte
+    const isLoss = randVal < riskFactor;
+    
+    // Sélection déterministe de la position du gardien (0 à 5)
+    const keeperPos = parseInt(hash.substring(8, 12), 16) % 6;
+
+    return { hash, isLoss, keeperPos };
 }
 
-// --- BASE DE DONNÉES EN MÉMOIRE ---
-const players = {};
-const leaderboard = [
-    { name: 'Satoshi_N', netWorth: 250000 },
-    { name: 'Whale_Trader', netWorth: 120000 },
-    { name: 'GoldHunter', netWorth: 45000 }
-];
-
-// --- GESTION TEMPS RÉEL (SOCKET.IO) ---
+// --- GESTION DES SOCKETS & SÉCURITÉ UN-APPAREIL ---
 io.on('connection', (socket) => {
-    players[socket.id] = {
-        id: socket.id,
-        name: `Trader_${socket.id.substring(0, 4)}`,
-        balance: 1000,
-        debt: 0,
-        creditScore: 750,
-        serverSeed: crypto.randomBytes(16).toString('hex'),
-        clientSeed: 'default_user_seed',
-        nonce: 0,
-        inGame: false,
-        currentBet: 0,
-        step: 0
-    };
-
-    const player = players[socket.id];
-
-    socket.emit('init_state', {
-        player,
-        leaderboard
-    });
-
-    socket.on('take_loan', (amount) => {
-        if (player.debt > 0) {
-            return socket.emit('error_msg', "Remboursez d'abord votre prêt actif !");
-        }
-        if (amount > 1000) {
-            return socket.emit('error_msg', "Plafond de prêt dépassé ($1,000 max) !");
+    
+    // ÉVÉNEMENT 1 : AUTHENTIFICATION STRICTE PAR APPAREIL
+    socket.on('authenticate_device', (deviceFingerprint) => {
+        if (!deviceFingerprint) {
+            return socket.emit('auth_error', 'Empreinte d appareil invalide.');
         }
 
-        const interest = Math.round(amount * 0.10);
-        player.debt = amount + interest;
-        player.balance += amount;
-        
-        broadcastUpdate(socket, player);
-    });
-
-    socket.on('repay_loan', () => {
-        if (player.debt === 0) return;
-        if (player.balance < player.debt) {
-            return socket.emit('error_msg', 'Solde insuffisant pour rembourser la dette !');
+        let accountId;
+        if (devices[deviceFingerprint]) {
+            // Appareil déjà reconnu -> Connexion au compte existant
+            accountId = devices[deviceFingerprint];
+        } else {
+            // Nouvel appareil -> Création d'UN SEUL compte verrouillé sur cet appareil
+            accountId = `ACC_${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+            devices[deviceFingerprint] = accountId;
+            
+            accounts[accountId] = {
+                id: accountId,
+                device: deviceFingerprint,
+                balance: 1000,
+                debt: 0,
+                creditScore: 750,
+                serverSeed: crypto.randomBytes(16).toString('hex'),
+                clientSeed: deviceFingerprint.substring(0, 10),
+                nonce: 0,
+                inGame: false,
+                currentBet: 100,
+                step: 0
+            };
         }
 
-        player.balance -= player.debt;
-        player.debt = 0;
-        player.creditScore = Math.min(850, player.creditScore + 15);
+        socket.accountId = accountId;
+        socket.join(accountId);
 
-        broadcastUpdate(socket, player);
+        const player = accounts[accountId];
+        socket.emit('auth_success', { player, leaderboard });
     });
 
+    // ÉVÉNEMENT 2 : TIR DE PENALTY (AVEC GRAPHISMES & RISQUE DYNAMIQUE)
     socket.on('play_shot', (targetZone) => {
+        const player = accounts[socket.accountId];
+        if (!player) return;
+
         const multipliers = [1.95, 3.80, 7.50, 15.00, 30.00];
 
         if (!player.inGame) {
@@ -97,561 +106,366 @@ io.on('connection', (socket) => {
         }
 
         player.nonce++;
-        const pfResult = generateProvablyFairResult(player.serverSeed, player.clientSeed, player.nonce);
-        const keeperPos = pfResult.keeperPosition;
+        
+        // Calcul du risque dynamique selon le taux de mise
+        const currentRisk = calculateAdjustedRisk(player, player.currentBet);
+        const pf = generateFairDraw(player.serverSeed, player.clientSeed, player.nonce, currentRisk);
+
+        let keeperPos = pf.keeperPos;
+        // Si le tirage indique une perte, le gardien s'aligne sur la zone ciblée
+        if (pf.isLoss) {
+            keeperPos = targetZone;
+        }
 
         if (targetZone === keeperPos) {
-            const lostBet = player.currentBet;
+            // ARRÊT -> PERTE
+            const lostAmount = player.currentBet;
             player.inGame = false;
             player.step = 0;
 
-            checkLiquidation(player, socket);
+            // Vérification de liquidation si dette
+            if (player.debt > 0 && player.balance < (player.debt * 0.2)) {
+                player.balance = 0;
+                player.debt = 0;
+                player.creditScore = Math.max(300, player.creditScore - 100);
+                socket.emit('liquidation_event', "LIQUIDATION : Solde insuffisant pour couvrir la marge !");
+            }
 
             socket.emit('shot_result', {
                 success: false,
+                targetZone,
                 keeperPos,
-                msg: `ARRÊTÉ ! Vous avez perdu $${lostBet}`,
-                hash: pfResult.hash,
-                nonce: player.nonce
+                msg: `ARRÊTÉ ! -$${lostAmount}`,
+                hash: pf.hash
             });
         } else {
+            // BUT MARQUÉ !
             player.step++;
-            const currentMult = multipliers[player.step - 1];
+            const mult = multipliers[player.step - 1];
 
             if (player.step >= multipliers.length) {
-                const winAmount = Math.round(player.currentBet * currentMult);
+                const winAmount = Math.round(player.currentBet * mult);
                 player.balance += winAmount;
                 player.inGame = false;
 
                 socket.emit('shot_result', {
                     success: true,
+                    targetZone,
                     keeperPos,
+                    mult,
                     winAmount,
-                    mult: currentMult,
                     isJackpot: true,
                     msg: `JACKPOT ULTIME ! +$${winAmount.toLocaleString()}`,
-                    hash: pfResult.hash,
-                    nonce: player.nonce
+                    hash: pf.hash
                 });
             } else {
                 socket.emit('shot_result', {
                     success: true,
+                    targetZone,
                     keeperPos,
-                    mult: currentMult,
+                    mult,
                     step: player.step,
-                    msg: `BUT ! Multiplicateur actuel : x${currentMult}`,
-                    hash: pfResult.hash,
-                    nonce: player.nonce
+                    msg: `BUT ! Multiplicateur x${mult}`,
+                    hash: pf.hash
                 });
             }
         }
 
-        broadcastUpdate(socket, player);
+        updateAndBroadcast(socket, player);
     });
 
+    // ÉVÉNEMENT 3 : CASHOUT
     socket.on('cashout', () => {
-        if (!player.inGame || player.step === 0) return;
+        const player = accounts[socket.accountId];
+        if (!player || !player.inGame || player.step === 0) return;
 
         const multipliers = [1.95, 3.80, 7.50, 15.00, 30.00];
         const winAmount = Math.round(player.currentBet * multipliers[player.step - 1]);
-        
+
         player.balance += winAmount;
         player.inGame = false;
         player.step = 0;
 
-        socket.emit('cashout_success', {
-            winAmount,
-            msg: `ENCAISSÉ AVEC SUCCÈS ! +$${winAmount.toLocaleString()}`
-        });
-
-        broadcastUpdate(socket, player);
+        socket.emit('cashout_success', { winAmount, msg: `ENCAISSÉ ! +$${winAmount.toLocaleString()}` });
+        updateAndBroadcast(socket, player);
     });
 
-    socket.on('set_bet', (bet) => {
-        if (!player.inGame) player.currentBet = parseFloat(bet) || 0;
+    // ÉVÉNEMENT 4 : BANQUE & EMPRUNTS
+    socket.on('take_loan', () => {
+        const player = accounts[socket.accountId];
+        if (!player) return;
+
+        if (player.debt > 0) return socket.emit('error_msg', 'Remboursez votre prêt en cours !');
+        
+        player.debt = 550; // $500 empruntés + 10% frais
+        player.balance += 500;
+        updateAndBroadcast(socket, player);
     });
 
-    socket.on('disconnect', () => {
-        delete players[socket.id];
+    socket.on('repay_loan', () => {
+        const player = accounts[socket.accountId];
+        if (!player) return;
+
+        if (player.balance < player.debt) return socket.emit('error_msg', 'Solde insuffisant pour rembourser la dette.');
+        
+        player.balance -= player.debt;
+        player.debt = 0;
+        player.creditScore = Math.min(850, player.creditScore + 20);
+        updateAndBroadcast(socket, player);
+    });
+
+    socket.on('set_bet', (amount) => {
+        const player = accounts[socket.accountId];
+        if (player && !player.inGame) player.currentBet = Math.max(10, parseFloat(amount) || 10);
     });
 });
 
-function checkLiquidation(player, socket) {
-    if (player.debt > 0 && player.balance < (player.debt * 0.2)) {
-        player.balance = 0;
-        player.debt = 0;
-        player.creditScore = Math.max(300, player.creditScore - 100);
-        socket.emit('liquidation_alert', "LIQUIDATION SÈCHE ! Votre dette a absorbé l'intégralité de votre solde.");
+function updateAndBroadcast(socket, player) {
+    let lbItem = leaderboard.find(l => l.id === player.id);
+    if (!lbItem) {
+        lbItem = { id: player.id, netWorth: 0 };
+        leaderboard.push(lbItem);
     }
-}
-
-function broadcastUpdate(socket, player) {
-    let userRank = leaderboard.find(p => p.name === player.name);
-    if (!userRank) {
-        userRank = { name: player.name, netWorth: 0 };
-        leaderboard.push(userRank);
-    }
-    userRank.netWorth = player.balance - player.debt;
+    lbItem.netWorth = player.balance - player.debt;
     leaderboard.sort((a, b) => b.netWorth - a.netWorth);
 
     socket.emit('update_player', player);
     io.emit('update_leaderboard', leaderboard.slice(0, 5));
 }
 
-// --- RENDU APPLICATION ---
+// --- INTERFACE CLIENT BOOTSTRAP 5 + ANIMATIONS CANVAS ---
 app.get('*', (req, res) => {
     res.send(`<!DOCTYPE html>
-<html lang="fr">
+<html lang="fr" data-bs-theme="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>GOLD RUSH - Ultimate Financial Arcade</title>
-    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;800;900&family=Rajdhani:wght@500;700&display=swap" rel="stylesheet">
+    <title>GOLD RUSH - Pro Financial Arcade</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Rajdhani:wght@600;700&display=swap" rel="stylesheet">
     <script src="/socket.io/socket.io.js"></script>
     <style>
         :root {
-            --bg-dark: #07090e;
-            --panel-bg: rgba(15, 20, 29, 0.9);
-            --gold-primary: #ffd700;
-            --gold-gradient: linear-gradient(135deg, #fff3a8 0%, #ffd700 50%, #996515 100%);
-            --gold-glow: 0 0 15px rgba(255, 215, 0, 0.35);
-            --red-alert: #ff2a5f;
-            --green-win: #00e676;
-            --text-main: #f0f4f8;
-            --text-muted: #64748b;
+            --gold: #ffd700;
+            --gold-glow: 0 0 20px rgba(255, 215, 0, 0.4);
+            --bg-dark: #080b11;
         }
-
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Rajdhani', sans-serif; user-select: none; -webkit-tap-highlight-color: transparent; }
 
         body {
             background-color: var(--bg-dark);
-            color: var(--text-main);
+            font-family: 'Rajdhani', sans-serif;
+            color: #f0f4f8;
             min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            overflow-x: hidden;
-            background-image: radial-gradient(circle at 50% 0%, rgba(255, 215, 0, 0.05) 0%, transparent 70%);
         }
 
-        header {
-            background: rgba(15, 20, 29, 0.95);
-            border-bottom: 1px solid rgba(255, 215, 0, 0.2);
-            padding: 12px 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            position: sticky;
-            top: 0;
-            z-index: 100;
-            backdrop-filter: blur(10px);
-        }
+        .font-orbitron { font-family: 'Orbitron', sans-serif; }
+        .text-gold { color: var(--gold); text-shadow: 0 0 10px rgba(255,215,0,0.3); }
+        .bg-glass { background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(12px); border: 1px solid rgba(255, 215, 0, 0.15); }
+        .card-gold { border: 1px solid rgba(255, 215, 0, 0.3); box-shadow: inset 0 0 15px rgba(255, 215, 0, 0.05); }
 
-        .logo {
-            font-family: 'Orbitron', sans-serif;
-            font-size: 1.4rem;
-            font-weight: 900;
-            background: var(--gold-gradient);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            letter-spacing: 1px;
-        }
-
-        .wallet-bar { display: flex; gap: 12px; align-items: center; }
-
-        .stat-badge {
-            background: rgba(255, 215, 0, 0.08);
-            border: 1px solid rgba(255, 215, 0, 0.3);
-            border-radius: 20px;
-            padding: 6px 14px;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }
-
-        .stat-value {
-            font-family: 'Orbitron', sans-serif;
-            font-size: 1rem;
-            font-weight: 700;
-            color: var(--gold-primary);
-        }
-
-        .app-container {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            padding: 12px;
-            gap: 12px;
-            max-width: 1400px;
-            margin: 0 auto;
+        /* CANVAS DE JEU GRAPHIQUE */
+        #gameCanvas {
             width: 100%;
+            height: 280px;
+            background: radial-gradient(circle at center, #111a2e 0%, #05080e 100%);
+            border-radius: 12px;
+            border: 2px solid rgba(255, 215, 0, 0.3);
         }
 
-        .mobile-tabs {
-            display: flex;
-            background: var(--panel-bg);
-            border-radius: 10px;
-            padding: 4px;
-            border: 1px solid rgba(255, 255, 255, 0.05);
-        }
-
-        .tab-btn {
-            flex: 1;
-            padding: 10px;
-            text-align: center;
-            font-weight: 700;
-            font-size: 0.85rem;
-            color: var(--text-muted);
-            border-radius: 8px;
-            cursor: pointer;
-            text-transform: uppercase;
-        }
-
-        .tab-btn.active {
-            background: var(--gold-gradient);
-            color: #000;
-            box-shadow: var(--gold-glow);
-        }
-
-        .tab-content { display: none; flex-direction: column; gap: 12px; }
-        .tab-content.active { display: flex; }
-
-        .panel {
-            background: var(--panel-bg);
-            border-radius: 14px;
-            padding: 16px;
-            border: 1px solid rgba(255, 255, 255, 0.05);
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-            backdrop-filter: blur(5px);
-        }
-
-        .panel-title {
-            font-family: 'Orbitron', sans-serif;
-            font-size: 0.9rem;
-            color: var(--gold-primary);
-            border-bottom: 1px solid rgba(255,215,0,0.15);
-            padding-bottom: 8px;
-            text-transform: uppercase;
-        }
-
-        .game-card {
-            background: radial-gradient(circle at top, #141c2b 0%, #090d15 100%);
-            border: 1px solid rgba(255, 215, 0, 0.25);
-            border-radius: 16px;
-            padding: 16px;
-            display: flex;
-            flex-direction: column;
-            gap: 16px;
-            box-shadow: inset 0 0 30px rgba(0,0,0,0.8);
-        }
-
-        .mult-bar { display: flex; gap: 8px; justify-content: center; overflow-x: auto; padding-bottom: 4px; }
-        .mult-step {
-            font-family: 'Orbitron', sans-serif;
-            padding: 6px 14px;
-            border-radius: 16px;
-            font-size: 0.85rem;
-            font-weight: 700;
-            color: var(--text-muted);
-            background: rgba(255, 255, 255, 0.04);
-            border: 1px solid rgba(255, 255, 255, 0.05);
-        }
-
-        .mult-step.active {
-            color: #000;
-            background: var(--gold-gradient);
-            box-shadow: var(--gold-glow);
-            transform: scale(1.05);
-        }
-
-        .stadium {
-            width: 100%;
-            height: 220px;
-            border: 3px solid #fff;
-            border-bottom: 2px dashed rgba(255,255,255,0.2);
-            border-radius: 12px 12px 0 0;
-            position: relative;
-            background: radial-gradient(circle at bottom, rgba(0, 230, 118, 0.1) 0%, transparent 70%);
-            overflow: hidden;
-        }
-
-        .keeper {
-            width: 44px;
-            height: 44px;
-            background: var(--red-alert);
-            border-radius: 50%;
-            position: absolute;
-            top: 20px;
-            left: calc(50% - 22px);
-            transition: all 0.35s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-            box-shadow: 0 0 15px var(--red-alert);
-        }
-
-        .target-grid {
+        .target-btn-grid {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
-            grid-template-rows: repeat(2, 1fr);
-            height: 100%;
-            gap: 8px;
-            padding: 8px;
+            gap: 10px;
+            margin-top: -80px;
+            position: relative;
+            z-index: 10;
+            padding: 0 15px;
         }
 
-        .target-btn {
-            border: 1px dashed rgba(255, 215, 0, 0.3);
+        .target-node {
+            height: 60px;
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px dashed rgba(255, 215, 0, 0.4);
             border-radius: 8px;
+            color: var(--gold);
+            font-size: 1.5rem;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 1.5rem;
-            background: rgba(0,0,0,0.2);
-            cursor: pointer;
-        }
-
-        .target-btn:active { background: rgba(255, 215, 0, 0.3); transform: scale(0.95); }
-
-        .btn {
-            padding: 14px;
-            border-radius: 10px;
-            border: none;
-            font-weight: 700;
-            font-size: 0.95rem;
-            text-transform: uppercase;
             cursor: pointer;
             transition: all 0.2s;
         }
 
-        .btn-gold { background: var(--gold-gradient); color: #000; box-shadow: var(--gold-glow); }
-        .btn-green { background: var(--green-win); color: #000; box-shadow: 0 0 15px rgba(0, 230, 118, 0.4); }
-        .btn-danger { background: linear-gradient(135deg, #ff2a5f 0%, #990026 100%); color: #fff; }
-        .btn:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
-
-        .input-box {
-            background: rgba(0,0,0,0.5);
-            border: 1px solid rgba(255, 215, 0, 0.3);
-            border-radius: 10px;
-            display: flex;
-            align-items: center;
-            padding: 0 12px;
+        .target-node:hover {
+            background: rgba(255, 215, 0, 0.2);
+            border-style: solid;
+            transform: scale(1.03);
         }
 
-        .input-box input {
-            width: 100%;
-            background: transparent;
+        .btn-gold {
+            background: linear-gradient(135deg, #fff3a8 0%, #ffd700 50%, #996515 100%);
+            color: #000;
+            font-weight: 800;
             border: none;
-            color: #fff;
-            font-family: 'Orbitron', sans-serif;
-            font-size: 1.1rem;
-            padding: 10px 0;
-            outline: none;
+            box-shadow: var(--gold-glow);
         }
 
-        .leader-item {
-            display: flex;
-            justify-content: space-between;
-            padding: 10px;
-            background: rgba(255, 255, 255, 0.02);
-            border-radius: 8px;
-            font-size: 0.9rem;
-        }
-
-        @media (min-width: 900px) {
-            .mobile-tabs { display: none; }
-            .app-container {
-                display: grid;
-                grid-template-columns: 300px 1fr 320px;
-                align-items: start;
-                padding: 24px;
-                gap: 20px;
-            }
-            .tab-content { display: flex !important; }
-            .stadium { height: 260px; }
-            .logo { font-size: 1.8rem; }
-        }
+        .btn-gold:hover { color: #000; opacity: 0.9; }
     </style>
 </head>
 <body>
 
-    <header>
-        <div class="logo">GOLD RUSH 🪙</div>
-        <div class="wallet-bar">
-            <div class="stat-badge">
-                <span style="font-size:0.75rem; color:var(--text-muted)">SOLDE:</span>
-                <span class="stat-value" id="balance-display">$0</span>
+    <nav class="navbar navbar-expand-lg bg-glass sticky-top border-bottom border-warning border-opacity-25">
+        <div class="container">
+            <a class="navbar-brand font-orbitron fw-bold text-gold fs-4" href="#">GOLD RUSH 🪙</a>
+            <div class="d-flex align-items-center gap-3">
+                <div class="bg-black bg-opacity-50 px-3 py-1 rounded-pill border border-warning border-opacity-25">
+                    <small class="text-secondary me-1">SOLDE:</small>
+                    <span id="balance-txt" class="font-orbitron fw-bold text-gold">$0</span>
+                </div>
             </div>
         </div>
-    </header>
+    </nav>
 
-    <div class="app-container">
-
-        <div class="mobile-tabs">
-            <div class="tab-btn active" onclick="switchTab('game', event)">🎮 Jeu</div>
-            <div class="tab-btn" onclick="switchTab('bank', event)">🏦 Banque</div>
-            <div class="tab-btn" onclick="switchTab('ranks', event)">🏆 Rangs</div>
-        </div>
-
-        <div class="tab-content" id="tab-bank">
-            <div class="panel">
-                <div class="panel-title">Système de Prêt</div>
-                <div style="display:flex; justify-content:space-between;">
-                    <span>Dette Active:</span>
-                    <span id="debt-display" style="color:var(--red-alert); font-weight:bold;">$0</span>
-                </div>
-                <div style="display:flex; justify-content:space-between;">
-                    <span>Score de Crédit:</span>
-                    <span id="credit-display" style="color:var(--green-win); font-weight:bold;">750</span>
-                </div>
-                <button class="btn btn-gold" onclick="takeLoan()">Emprunter $500 (Intérêt 10%)</button>
-                <button class="btn btn-danger" onclick="repayLoan()">Rembourser la Dette</button>
-            </div>
+    <div class="container my-4">
+        <div class="row g-4">
             
-            <div class="panel">
-                <div class="panel-title">Provably Fair (SHA-256)</div>
-                <div style="font-size:0.8rem; color:var(--text-muted); word-break:break-all;">
-                    <span>Dernier Hash Serveur:</span>
-                    <div id="hash-display" style="color:var(--gold-primary); margin-top:4px; font-family:monospace;">-</div>
-                </div>
-            </div>
-        </div>
-
-        <div class="tab-content active" id="tab-game">
-            <div class="game-card">
-                
-                <div class="mult-bar">
-                    <div class="mult-step" id="step-0">x1.95</div>
-                    <div class="mult-step" id="step-1">x3.80</div>
-                    <div class="mult-step" id="step-2">x7.50</div>
-                    <div class="mult-step" id="step-3">x15.00</div>
-                    <div class="mult-step" id="step-4">x30.00</div>
-                </div>
-
-                <div id="status-display" style="text-align:center; font-family:'Orbitron'; font-size:0.85rem; color:var(--gold-primary); min-height:20px;">
-                    CHOISISSEZ UNE ZONE ET TIREZ !
-                </div>
-
-                <div class="stadium">
-                    <div class="keeper" id="keeper"></div>
-                    <div class="target-grid">
-                        <div class="target-btn" onclick="shoot(0)">⚽</div>
-                        <div class="target-btn" onclick="shoot(1)">⚽</div>
-                        <div class="target-btn" onclick="shoot(2)">⚽</div>
-                        <div class="target-btn" onclick="shoot(3)">⚽</div>
-                        <div class="target-btn" onclick="shoot(4)">⚽</div>
-                        <div class="target-btn" onclick="shoot(5)">⚽</div>
+            <div class="col-lg-3">
+                <div class="card bg-glass card-gold p-3 mb-3">
+                    <h6 class="font-orbitron text-gold mb-3">🏦 BANQUE & EMPRUNTS</h6>
+                    <div class="d-flex justify-content-between mb-2">
+                        <span class="text-secondary">Dette Active:</span>
+                        <span id="debt-txt" class="text-danger fw-bold">$0</span>
                     </div>
-                </div>
-
-                <div style="display:flex; flex-direction:column; gap:10px;">
-                    <div class="input-box">
-                        <span style="color:var(--gold-primary); margin-right:6px; font-weight:bold">$</span>
-                        <input type="number" id="bet-amount" value="100" min="10" onchange="updateBet()">
+                    <div class="d-flex justify-content-between mb-3">
+                        <span class="text-secondary">Score Crédit:</span>
+                        <span id="credit-txt" class="text-success fw-bold">750</span>
                     </div>
-                    <button class="btn btn-green" id="cashout-btn" onclick="cashout()" disabled>ENCAISSER</button>
+                    <button class="btn btn-gold w-100 mb-2" onclick="takeLoan()">Emprunter $500</button>
+                    <button class="btn btn-outline-danger w-100" onclick="repayLoan()">Rembourser</button>
                 </div>
 
+                <div class="card bg-glass p-3">
+                    <h6 class="font-orbitron text-gold mb-2">🔒 APPAREIL BINDED</h6>
+                    <small class="text-secondary mb-1">ID Compte Unique :</small>
+                    <code id="account-id-txt" class="text-warning font-monospace">Chargement...</code>
+                </div>
             </div>
-        </div>
 
-        <div class="tab-content" id="tab-ranks">
-            <div class="panel">
-                <div class="panel-title">Wall Street Leaderboard 🏆</div>
-                <div id="leaderboard-list" style="display:flex; flex-direction:column; gap:8px;"></div>
+            <div class="col-lg-6">
+                <div class="card bg-glass card-gold p-3">
+                    
+                    <div class="d-flex justify-content-between mb-3 text-center">
+                        <span class="badge bg-dark border border-secondary p-2 flex-fill mx-1 mult-badge" id="m-0">x1.95</span>
+                        <span class="badge bg-dark border border-secondary p-2 flex-fill mx-1 mult-badge" id="m-1">x3.80</span>
+                        <span class="badge bg-dark border border-secondary p-2 flex-fill mx-1 mult-badge" id="m-2">x7.50</span>
+                        <span class="badge bg-dark border border-secondary p-2 flex-fill mx-1 mult-badge" id="m-3">x15.00</span>
+                        <span class="badge bg-dark border border-secondary p-2 flex-fill mx-1 mult-badge" id="m-4">x30.00</span>
+                    </div>
+
+                    <div id="status-txt" class="text-center font-orbitron text-gold mb-2 small">
+                        INITIALISATION...
+                    </div>
+
+                    <canvas id="gameCanvas" width="600" height="280"></canvas>
+
+                    <div class="target-btn-grid">
+                        <div class="target-node" onclick="shoot(0)">⚽</div>
+                        <div class="target-node" onclick="shoot(1)">⚽</div>
+                        <div class="target-node" onclick="shoot(2)">⚽</div>
+                        <div class="target-node" onclick="shoot(3)">⚽</div>
+                        <div class="target-node" onclick="shoot(4)">⚽</div>
+                        <div class="target-node" onclick="shoot(5)">⚽</div>
+                    </div>
+
+                    <div class="row g-2 mt-3">
+                        <div class="col-6">
+                            <div class="input-group">
+                                <span class="input-group-text bg-black text-gold">$</span>
+                                <input type="number" id="bet-input" class="form-control bg-black text-white font-orbitron" value="100" onchange="updateBet()">
+                            </div>
+                        </div>
+                        <div class="col-6">
+                            <button id="cashout-btn" class="btn btn-success w-100 font-orbitron fw-bold" onclick="cashout()" disabled>ENCAISSER</button>
+                        </div>
+                    </div>
+
+                </div>
             </div>
-        </div>
 
+            <div class="col-lg-3">
+                <div class="card bg-glass p-3">
+                    <h6 class="font-orbitron text-gold mb-3">🏆 WALL STREET LEADERBOARD</h6>
+                    <div id="leaderboard-box" class="d-flex flex-column gap-2"></div>
+                </div>
+            </div>
+
+        </div>
     </div>
 
     <script>
         const socket = io();
-        let audioCtx = null;
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
 
-        function initAudio() {
-            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        // POSITIONS GRAPHIQUES DES 6 ZONES SUR LE CANVAS
+        const zoneCoords = [
+            { x: 120, y: 80 }, { x: 300, y: 80 }, { x: 480, y: 80 },
+            { x: 120, y: 160 }, { x: 300, y: 160 }, { x: 480, y: 160 }
+        ];
+
+        let keeperState = { x: 300, y: 120, targetX: 300, targetY: 120, color: '#ff2a5f' };
+        let ballState = { x: 300, y: 250, targetX: 300, targetY: 250, active: false };
+
+        // GENERATION D'EMPREINTE D'APPAREIL UNIQUE
+        function getDeviceFingerprint() {
+            let id = localStorage.getItem('gold_device_id');
+            if (!id) {
+                id = 'DEV_' + Math.random().toString(36).substring(2) + Date.now().toString(36);
+                localStorage.setItem('gold_device_id', id);
+            }
+            return id;
         }
 
-        function playSound(freq, duration) {
-            initAudio();
-            if(!audioCtx) return;
-            const osc = audioCtx.createOscillator();
-            const gain = audioCtx.createGain();
-            osc.frequency.value = freq;
-            osc.connect(gain);
-            gain.connect(audioCtx.destination);
-            osc.start();
-            gain.gain.exponentialRampToValueAtTime(0.00001, audioCtx.currentTime + duration);
-            osc.stop(audioCtx.currentTime + duration);
-        }
+        // CONNECT ET AUTHENTIFICATION AUTOMATIQUE
+        socket.on('connect', () => {
+            const fp = getDeviceFingerprint();
+            socket.emit('authenticate_device', fp);
+        });
 
-        function vibrate(ms) {
-            if (navigator.vibrate) navigator.vibrate(ms);
-        }
-
-        function switchTab(tabName, evt) {
-            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            
-            if(tabName === 'game') document.getElementById('tab-game').classList.add('active');
-            if(tabName === 'bank') document.getElementById('tab-bank').classList.add('active');
-            if(tabName === 'ranks') document.getElementById('tab-ranks').classList.add('active');
-            if(evt && evt.target) evt.target.classList.add('active');
-        }
-
-        socket.on('init_state', (data) => {
-            updatePlayerUI(data.player);
+        socket.on('auth_success', (data) => {
+            document.getElementById('account-id-txt').innerText = data.player.id;
+            updateUI(data.player);
             renderLeaderboard(data.leaderboard);
+            document.getElementById('status-txt').innerText = "CONNECTÉ - CHOISISSEZ UNE ZONE ET TIREZ !";
         });
 
-        socket.on('update_player', (player) => {
-            updatePlayerUI(player);
-        });
-
-        socket.on('update_leaderboard', (lb) => {
-            renderLeaderboard(lb);
-        });
+        socket.on('update_player', updateUI);
+        socket.on('update_leaderboard', renderLeaderboard);
 
         socket.on('shot_result', (res) => {
-            moveKeeper(res.keeperPos);
-            document.getElementById('hash-display').innerText = res.hash;
-
-            const status = document.getElementById('status-display');
-            status.innerText = res.msg;
+            animateShot(res.targetZone, res.keeperPos);
+            document.getElementById('status-txt').innerText = res.msg;
 
             if (res.success) {
-                playSound(600, 0.15);
-                vibrate(50);
-                status.style.color = "var(--gold-primary)";
                 highlightStep(res.step - 1);
                 document.getElementById('cashout-btn').disabled = false;
             } else {
-                playSound(150, 0.3);
-                vibrate([100, 50, 100]);
-                status.style.color = "var(--red-alert)";
-                resetGameUI();
+                resetMults();
+                document.getElementById('cashout-btn').disabled = true;
             }
         });
 
         socket.on('cashout_success', (res) => {
-            playSound(800, 0.25);
-            vibrate(100);
-            const status = document.getElementById('status-display');
-            status.innerText = res.msg;
-            status.style.color = "var(--green-win)";
-            resetGameUI();
+            document.getElementById('status-txt').innerText = res.msg;
+            resetMults();
+            document.getElementById('cashout-btn').disabled = true;
         });
 
-        socket.on('error_msg', (msg) => {
-            alert(msg);
-        });
+        socket.on('error_msg', alert);
 
-        socket.on('liquidation_alert', (msg) => {
-            playSound(100, 0.5);
-            vibrate(500);
-            alert(msg);
-        });
-
-        function shoot(zoneIndex) {
-            initAudio();
-            socket.emit('play_shot', zoneIndex);
+        function shoot(zoneIdx) {
+            socket.emit('play_shot', zoneIdx);
         }
 
         function cashout() {
@@ -659,71 +473,103 @@ app.get('*', (req, res) => {
         }
 
         function updateBet() {
-            const val = document.getElementById('bet-amount').value;
-            socket.emit('set_bet', val);
+            socket.emit('set_bet', document.getElementById('bet-input').value);
         }
 
-        function takeLoan() {
-            socket.emit('take_loan', 500);
-        }
+        function takeLoan() { socket.emit('take_loan'); }
+        function repayLoan() { socket.emit('repay_loan'); }
 
-        function repayLoan() {
-            socket.emit('repay_loan');
-        }
-
-        function updatePlayerUI(p) {
-            document.getElementById('balance-display').innerText = '$' + p.balance.toLocaleString();
-            document.getElementById('debt-display').innerText = '$' + p.debt.toLocaleString();
-            document.getElementById('credit-display').innerText = p.creditScore;
+        function updateUI(p) {
+            document.getElementById('balance-txt').innerText = '$' + p.balance.toLocaleString();
+            document.getElementById('debt-txt').innerText = '$' + p.debt.toLocaleString();
+            document.getElementById('credit-txt').innerText = p.creditScore;
         }
 
         function renderLeaderboard(lb) {
-            const container = document.getElementById('leaderboard-list');
-            container.innerHTML = '';
+            const box = document.getElementById('leaderboard-box');
+            box.innerHTML = '';
             lb.forEach((item, idx) => {
-                container.innerHTML += \`
-                    <div class="leader-item">
-                        <span style="color:var(--gold-primary); font-weight:bold;">#\${idx+1}</span>
-                        <span>\${item.name}</span>
-                        <span style="font-family:'Orbitron'">$\${item.netWorth.toLocaleString()}</span>
+                box.innerHTML += \`
+                    <div class="d-flex justify-content-between align-items-center p-2 rounded bg-black bg-opacity-40">
+                        <span class="text-gold fw-bold">#\${idx + 1}</span>
+                        <small class="font-monospace text-secondary">\${item.id}</small>
+                        <span class="font-orbitron fw-bold">$\${item.netWorth.toLocaleString()}</span>
                     </div>
                 \`;
             });
         }
 
-        function moveKeeper(pos) {
-            const keeper = document.getElementById('keeper');
-            const coords = [
-                { top: '15px', left: '15%' }, { top: '15px', left: '45%' }, { top: '15px', left: '75%' },
-                { top: '110px', left: '15%' }, { top: '110px', left: '45%' }, { top: '110px', left: '75%' }
-            ];
-            keeper.style.top = coords[pos].top;
-            keeper.style.left = coords[pos].left;
-        }
-
         function highlightStep(idx) {
-            document.querySelectorAll('.mult-step').forEach(el => el.classList.remove('active'));
+            resetMults();
             if (idx >= 0) {
-                const el = document.getElementById(\`step-\${idx}\`);
-                if (el) el.classList.add('active');
+                const badge = document.getElementById(\`m-\${idx}\`);
+                if (badge) {
+                    badge.classList.remove('bg-dark');
+                    badge.classList.add('bg-warning', 'text-dark', 'fw-bold');
+                }
             }
         }
 
-        function resetGameUI() {
-            document.getElementById('cashout-btn').disabled = true;
-            setTimeout(() => {
-                document.querySelectorAll('.mult-step').forEach(el => el.classList.remove('active'));
-            }, 1200);
+        function resetMults() {
+            document.querySelectorAll('.mult-badge').forEach(b => {
+                b.className = 'badge bg-dark border border-secondary p-2 flex-fill mx-1 mult-badge';
+            });
         }
 
+        // ANIMATIONS CANVAS EN TEMPS RÉEL (60 FPS)
+        function animateShot(targetZoneIdx, keeperPosIdx) {
+            const targetCoords = zoneCoords[targetZoneIdx];
+            const keeperCoords = zoneCoords[keeperPosIdx];
+
+            keeperState.targetX = keeperCoords.x;
+            keeperState.targetY = keeperCoords.y;
+
+            ballState.x = 300;
+            ballState.y = 250;
+            ballState.targetX = targetCoords.x;
+            ballState.targetY = targetCoords.y;
+            ballState.active = true;
+        }
+
+        function renderLoop() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // DESSINER LE BUT EN NEON
+            ctx.strokeStyle = 'rgba(255, 215, 0, 0.4)';
+            ctx.lineWidth = 4;
+            ctx.strokeRect(60, 40, 480, 160);
+
+            // ANIME LE GARDIEN (INTERPOLATION SMOOTH)
+            keeperState.x += (keeperState.targetX - keeperState.x) * 0.15;
+            keeperState.y += (keeperState.targetY - keeperState.y) * 0.15;
+
+            ctx.fillStyle = keeperState.color;
+            ctx.beginPath();
+            ctx.arc(keeperState.x, keeperState.y, 22, 0, Math.PI * 2);
+            ctx.fill();
+
+            // ANIME LA BALLE
+            if (ballState.active) {
+                ballState.x += (ballState.targetX - ballState.x) * 0.2;
+                ballState.y += (ballState.targetY - ballState.y) * 0.2;
+
+                ctx.fillStyle = '#ffffff';
+                ctx.beginPath();
+                ctx.arc(ballState.x, ballState.y, 10, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            requestAnimationFrame(renderLoop);
+        }
+
+        renderLoop();
         updateBet();
     </script>
 </body>
 </html>`);
 });
 
-// PORTS POUR RENDER
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`🚀 Serveur Gold Rush prêt sur le port ${PORT}`);
+    console.log(`🚀 Serveur Gold Rush Ultra en ligne sur le port ${PORT}`);
 });
